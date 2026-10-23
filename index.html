@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LSM Storage Engine — Source Explorer</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #101419; color: #dce3ea; }
+    header { padding: 1.1rem 1.5rem; border-bottom: 1px solid #28313a; }
+    h1 { margin: 0; font-size: 1.15rem; }
+    header p { margin: .25rem 0 0; color: #91a0af; font-size: .9rem; }
+    main { display: grid; grid-template-columns: 260px minmax(0, 1fr); min-height: calc(100vh - 76px); }
+    aside { padding: 1rem; border-right: 1px solid #28313a; background: #151b22; }
+    .label { color: #91a0af; font-size: .75rem; letter-spacing: .08em; text-transform: uppercase; }
+    .tree, .tree ul { list-style: none; margin: .55rem 0; padding-left: .8rem; }
+    .tree { padding-left: 0; }
+    .folder { color: #9fc5e8; font-weight: 600; }
+    button { width: 100%; padding: .28rem .4rem; border: 0; border-radius: 4px; background: transparent; color: inherit; cursor: pointer; font: .85rem ui-monospace, SFMono-Regular, Consolas, monospace; text-align: left; }
+    button:hover, button.active { background: #263646; color: #fff; }
+    section { min-width: 0; }
+    #path { margin: 0; padding: .75rem 1.25rem; border-bottom: 1px solid #28313a; color: #9fc5e8; font: .85rem ui-monospace, SFMono-Regular, Consolas, monospace; }
+    pre { margin: 0; padding: 1.25rem; overflow: auto; font: .86rem/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; tab-size: 4; white-space: pre; }
+    .error { color: #ffb4ab; }
+    @media (max-width: 650px) { main { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid #28313a; } .tree { columns: 2; } .tree ul { break-inside: avoid; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>LSM Storage Engine</h1>
+    <p>Go implementation of a log-structured merge-tree storage engine.</p>
+  </header>
+  <main>
+    <aside>
+      <div class="label">Project files</div>
+      <ul class="tree">
+        <li><button data-file="README.md">README.md</button></li>
+        <li><button data-file="go.mod">go.mod</button></li>
+        <li><button data-file="go.sum">go.sum</button></li>
+        <li><span class="folder">cmd</span><ul><li><span class="folder">lsm-cli</span><ul><li><button data-file="cmd/lsm-cli/main.go">main.go</button></li></ul></li></ul></li>
+        <li><span class="folder">internal</span><ul>
+          <li><span class="folder">filter</span><ul><li><button data-file="internal/filter/bloom.go">bloom.go</button></li><li><button data-file="internal/filter/bloom_test.go">bloom_test.go</button></li></ul></li>
+          <li><span class="folder">manifest</span><ul><li><button data-file="internal/manifest/manifest.go">manifest.go</button></li></ul></li>
+          <li><span class="folder">memtable</span><ul><li><button data-file="internal/memtable/memtable.go">memtable.go</button></li></ul></li>
+          <li><span class="folder">sstable</span><ul><li><button data-file="internal/sstable/sstable.go">sstable.go</button></li></ul></li>
+          <li><span class="folder">wal</span><ul><li><button data-file="internal/wal/wal.go">wal.go</button></li></ul></li>
+        </ul></li>
+        <li><span class="folder">pkg</span><ul><li><span class="folder">lsm</span><ul>
+          <li><button data-file="pkg/lsm/compaction.go">compaction.go</button></li><li><button data-file="pkg/lsm/db.go">db.go</button></li><li><button data-file="pkg/lsm/db_test.go">db_test.go</button></li><li><button data-file="pkg/lsm/errors.go">errors.go</button></li><li><button data-file="pkg/lsm/types.go">types.go</button></li>
+        </ul></li></ul></li>
+      </ul>
+    </aside>
+    <section>
+      <p id="path">Select a file</p>
+      <pre id="source">Loading…</pre>
+    </section>
+  </main>
+  <script>
+    const pathLabel = document.querySelector('#path');
+    const source = document.querySelector('#source');
+    const files = [...document.querySelectorAll('[data-file]')];
+
+    async function showFile(path, button) {
+      files.forEach(item => item.classList.toggle('active', item === button));
+      pathLabel.textContent = './' + path;
+      source.className = '';
+      source.textContent = 'Loading…';
+      try {
+        const response = await fetch(path);
+        if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+        source.textContent = await response.text();
+      } catch (error) {
+        source.className = 'error';
+        source.textContent = `Could not load ${path}.\n\nServe this folder with a local web server, for example:\n  py -m http.server 8080\n\nThen visit http://localhost:8080\n\n${error.message}`;
+      }
+    }
+
+    files.forEach(button => button.addEventListener('click', () => showFile(button.dataset.file, button)));
+    showFile('pkg/lsm/compaction.go', document.querySelector('[data-file="pkg/lsm/compaction.go"]'));
+  </script>
+</body>
+</html>
