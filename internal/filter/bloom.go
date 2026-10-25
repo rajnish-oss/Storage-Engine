@@ -1,14 +1,51 @@
 package filter
 
 import (
+
 	"github.com/spaolacci/murmur3"
 	"math"
+	"errors"
+	"encoding/binary"
 )
 
 type BloomFilter struct {
 	Bitset []byte
 	Size   uint64 // total bits (m)
 	K      uint32 // number of hash functions
+}
+
+var (
+	ErrCorruptFilter = errors.New("corrupt bloom filter binary payload")
+)
+
+func (bf *BloomFilter) MarshalBinary() ([]byte, error) {
+	buf := make([]byte, 8+4+len(bf.Bitset))
+	binary.BigEndian.PutUint64(buf[0:8], bf.Size)
+	binary.BigEndian.PutUint32(buf[8:12], bf.K)
+	copy(buf[12:], bf.Bitset)
+	return buf, nil
+}
+
+// UnmarshalBinary reconstructs a BloomFilter from a packed byte slice.
+func (bf *BloomFilter) UnmarshalBinary(data []byte) error {
+	if len(data) < 12 {
+		return ErrCorruptFilter
+	}
+
+	bf.Size = binary.BigEndian.Uint64(data[0:8])
+	bf.K = binary.BigEndian.Uint32(data[8:12])
+
+	expectedBytes := int((bf.Size + 7) / 8)
+	bitsetPayload := data[12:]
+
+	if len(bitsetPayload) != expectedBytes {
+		return ErrCorruptFilter
+	}
+
+	bf.Bitset = make([]byte, expectedBytes)
+	copy(bf.Bitset, bitsetPayload)
+
+	return nil
 }
 
 // NewBloomFilter Sizes the Bitset given expected elements (n) and false positive rate (p)

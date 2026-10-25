@@ -1,61 +1,93 @@
 package wal
 
 import (
-	"encoding/gob"
-	"github.com/rajnish-oss/LSM_storage_engine/internal/memtable"
+	"errors"
 	"io"
 	"os"
+	"sync"
+
+	"github.com/rajnish-oss/LSM_storage_engine/internal/codec"
+	"github.com/rajnish-oss/LSM_storage_engine/internal/memtable"
 )
 
-type WAL[K comparable, V any] struct {
-	file    *os.File
-	encoder *gob.Encoder
+type WAL struct {
+	mu   sync.Mutex
+	file *os.File
+	path string
 }
 
-type WALEntry[K comparable, V any] struct {
-	Key   K
-	Value V
-}
-
-func NewWAL[K comparable, V any](path string) (*WAL[K, V], error) {
+func NewWAL(path string) (*WAL, error) {
 	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, err
 	}
-	return &WAL[K, V]{
-		file:    file,
-		encoder: gob.NewEncoder(file),
+	return &WAL{
+		file: file,
+		path: path,
 	}, nil
 }
 
-func (wal *WAL[K, V]) Write(key K, value V) error {
-	entry := WALEntry[K, V]{Key: key, Value: value}
-	return wal.encoder.Encode(&entry)
+func (w *WAL) Write(key, value []byte, isTombstone bool) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	_, err := codec.EncodeEntry(w.file, key, value, isTombstone)
+	return err
 }
 
-func ReplayWAL[K comparable, V any](path string) (*memtable.MemTable[K, V], error) {
-	memtable := memtable.NewMemTable[K, V]()
+func (w *WAL) Sync() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.file.Sync()
+}
+
+func (w *WAL) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.file != nil {
+		err := w.file.Close()
+		w.file = nil
+		return err
+	}
+	return nil
+}
+
+func (w *WAL) Remove() error {
+	if err := w.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+		return err
+	}
+	return os.Remove(w.path)
+}
+
+func ReplayWAL(path string) (*memtable.MemTable, error) {
+	m := memtable.NewMemTable()
+
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// If the file doesn't exist, that's fine. Return an empty memtable.
-			return memtable, nil
+			return m, nil
 		}
 		return nil, err
 	}
 	defer file.Close()
 
-	decoder := gob.NewDecoder(file)
 	for {
-		var entry WALEntry[K, V]
-		if err := decoder.Decode(&entry); err != nil {
-			if err == io.EOF {
-				break // We've reached the end of the file.
-			}
+		entry, err := codec.DecodeEntry(file)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
 			return nil, err
 		}
-		memtable.Put(entry.Key, entry.Value)
+
+		if entry.IsTombstone {
+			m.Delete(entry.Key)
+		} else {
+			m.Put(entry.Key, entry.Value)
+		}
 	}
 
-	return memtable, nil
+	return m, nil
 }

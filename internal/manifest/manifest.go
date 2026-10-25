@@ -2,7 +2,14 @@ package manifest
 
 import (
 	"os"
-	"encoding/gob"
+	"io"
+    "encoding/binary"
+    "errors"
+)
+
+var (
+	ErrCorruptManifest = errors.New("corrupt manifest: unexpected EOF or invalid length")
+	ErrPathTooLong     = errors.New("manifest path exceeds uint16 max length")
 )
 
 type Manifest struct {
@@ -20,14 +27,32 @@ func ReadManifest(path string) (*Manifest, error) {
     }
     defer file.Close()
 
-    var manifest Manifest
-    decoder := gob.NewDecoder(file)
-    err = decoder.Decode(&manifest)
-    if err != nil {
-        return nil, err
-    }
+    var countBuf [4]byte
+	if _, err := io.ReadFull(file, countBuf[:]); err != nil {
+		if errors.Is(err, io.EOF) {
+			return &Manifest{SSTablePaths: []string{}}, nil
+		}
+		return nil, err
+	}
+	count := binary.BigEndian.Uint32(countBuf[:])
+    paths := make([]string, 0, count)
 
-    return &manifest, nil
+    var lenBuf [2]byte
+	for i := uint32(0); i < count; i++ {
+		if _, err := io.ReadFull(file, lenBuf[:]); err != nil {
+			return nil, ErrCorruptManifest
+		}
+		strLen := binary.BigEndian.Uint16(lenBuf[:])
+
+		strBytes := make([]byte, strLen)
+		if _, err := io.ReadFull(file, strBytes); err != nil {
+			return nil, ErrCorruptManifest
+		}
+
+		paths = append(paths, string(strBytes))
+	}
+
+	return &Manifest{SSTablePaths: paths}, nil
 }
 
 func WriteManifest(path string, manifest *Manifest) error {
@@ -37,16 +62,49 @@ func WriteManifest(path string, manifest *Manifest) error {
         return err
     }
 
-    encoder := gob.NewEncoder(file)
-    if err := encoder.Encode(manifest); err != nil {
-        file.Close()
-        os.Remove(tmpPath)
-        return err
-    }
+    count := uint32(len(manifest.SSTablePaths))
+	var countBuf [4]byte
+	binary.BigEndian.PutUint32(countBuf[:], count)
 
-    if err := file.Close(); err != nil {
-        return err
-    }
+	if _, err := file.Write(countBuf[:]); err != nil {
+		file.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+
+    var lenBuf [2]byte
+	for _, p := range manifest.SSTablePaths {
+		if len(p) > 0xFFFF {
+			file.Close()
+			os.Remove(tmpPath)
+			return ErrPathTooLong
+		}
+
+		binary.BigEndian.PutUint16(lenBuf[:], uint16(len(p)))
+
+		if _, err := file.Write(lenBuf[:]); err != nil {
+			file.Close()
+			os.Remove(tmpPath)
+			return err
+		}
+
+		if _, err := file.Write([]byte(p)); err != nil {
+			file.Close()
+			os.Remove(tmpPath)
+			return err
+		}
+	}
+
+    if err := file.Sync(); err != nil {
+		file.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+
+	if err := file.Close(); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
     
     return os.Rename(tmpPath, path)
 }

@@ -1,166 +1,247 @@
 package lsm
 
 import (
+	"errors"
 	"fmt"
-	"github.com/rajnish-oss/LSM_storage_engine/internal/manifest"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
 	"github.com/rajnish-oss/LSM_storage_engine/internal/memtable"
 	"github.com/rajnish-oss/LSM_storage_engine/internal/sstable"
 	"github.com/rajnish-oss/LSM_storage_engine/internal/wal"
-	"log"
-	"os"
 )
 
-type DB[K comparable, V any] struct {
-	memtable            *memtable.MemTable[K, V]
-	maxMemtableSize     int
-	memtableSize        int
-	wal                 *wal.WAL[K, V]
-	walPath             string
-	sstables            []*sstable.SSTable[K, V]
-	sstableCounter      int
-	manifest            *manifest.Manifest
-	manifestPath        string
-	compactionThreshold int
+var (
+	ErrKeyNotFound = errors.New("key not found")
+	ErrDatabaseClosed = errors.New("database is closed")
+)
+
+// Options holds engine configuration parameters.
+type Options struct {
+	DataDir             string
+	MemTableThreshold   int64 // In bytes (e.g., 4MB = 4 * 1024 * 1024)
+	SSTableSamplingStep int   // Interval for sparse index entries (e.g., 16 or 64)
+	SyncWAL             bool  // If true, call fsync on every write
 }
 
-func NewDB[K comparable, V any](maxMemtableSize int, compactionThreshold int) (*DB[K, V], error) {
-	walPath := "db.wal"
-	memtable, err := wal.ReplayWAL[K, V](walPath) // this is the replay
-	if err != nil {
-		return nil, err
+func DefaultOptions(dataDir string) Options {
+	return Options{
+		DataDir:             dataDir,
+		MemTableThreshold:   4 * 1024 * 1024, // 4MB default
+		SSTableSamplingStep: 16,
+		SyncWAL:             false,
 	}
-
-	wal, err := wal.NewWAL[K, V](walPath)
-	if err != nil {
-		return nil, err
-	}
-
-	manifestPath := "MANIFEST"
-	manifest, err := manifest.ReadManifest(manifestPath)
-	if err != nil {
-		return nil, err
-	}
-
-	sstables := make([]*sstable.SSTable[K, V], len(manifest.SSTablePaths))
-	for i, path := range manifest.SSTablePaths {
-		sstables[i] = &sstable.SSTable[K, V]{Path: path}
-	}
-
-	return &DB[K, V]{
-		memtable:            memtable,
-		maxMemtableSize:     maxMemtableSize,
-		memtableSize:        len(memtable.Data),
-		wal:                 wal,
-		walPath:             walPath,
-		manifest:            manifest,
-		manifestPath:        manifestPath,
-		sstables:            sstables,
-		compactionThreshold: compactionThreshold,
-	}, nil
 }
 
-func (db *DB[K, V]) Compact() error {
-	compactedSSTablePath := fmt.Sprintf("data-compacted-%d.sstable", db.sstableCounter)
-	compactedSSTable, err := MergeSSTables(db.sstables, compactedSSTablePath)
+// DB represents the LSM storage engine instance.
+type DB struct {
+	mu        sync.RWMutex
+	flushMu   sync.Mutex // Serializes flush operations
+	opts      Options
+	activeMem *memtable.MemTable
+	immMem    *memtable.MemTable
+	wal       *wal.WAL
+	sstables  []*sstable.SSTable
+	closed    bool
+}
+
+// Open initializes or recovers an LSM DB directory.
+func Open(opts Options) (*DB, error) {
+	if err := os.MkdirAll(opts.DataDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create data dir: %w", err)
+	}
+
+	walPath := filepath.Join(opts.DataDir, "active.wal")
+
+	// Replay existing WAL if present
+	recoveredMem, err := wal.ReplayWAL(walPath)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("failed to replay WAL: %w", err)
 	}
-	// write new SSTable to MANIFEST file
-	db.manifest.SSTablePaths = []string{compactedSSTablePath}
-	if err := manifest.WriteManifest(db.manifestPath, db.manifest); err != nil {
-		return err
+
+	w, err := wal.NewWAL(walPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open WAL: %w", err)
 	}
-	//note delete only after writing manifest
-	for _, sstable := range db.sstables {
-		if err := os.Remove(sstable.Path); err != nil {
-			log.Printf("Failed to remove old sstable %s: %v", sstable.Path, err)
+
+	db := &DB{
+		opts:      opts,
+		activeMem: recoveredMem,
+		wal:       w,
+		sstables:  make([]*sstable.SSTable, 0),
+	}
+
+	return db, nil
+}
+
+// Put writes or updates a key-value pair.
+func (db *DB) Put(key, value []byte) error {
+	return db.write(key, value, false)
+}
+
+// Delete appends a deletion tombstone for the given key.
+func (db *DB) Delete(key []byte) error {
+	return db.write(key, nil, true)
+}
+
+func (db *DB) write(key, value []byte, isTombstone bool) error {
+	db.mu.Lock()
+	if db.closed {
+		db.mu.Unlock()
+		return ErrDatabaseClosed
+	}
+
+	// 1. Write to Write-Ahead Log
+	if err := db.wal.Write(key, value, isTombstone); err != nil {
+		db.mu.Unlock()
+		return fmt.Errorf("wal write failed: %w", err)
+	}
+
+	if db.opts.SyncWAL {
+		if err := db.wal.Sync(); err != nil {
+			db.mu.Unlock()
+			return fmt.Errorf("wal sync failed: %w", err)
 		}
 	}
 
-	db.sstables = []*sstable.SSTable[K, V]{compactedSSTable}
-	db.sstableCounter++
-
-	return nil
-}
-
-func (db *DB[K, V]) Put(key K, value V) error {
-
-	if err := db.wal.Write(key, value); err != nil {
-		return err
+	// 2. Insert into Active SkipList MemTable
+	if isTombstone {
+		db.activeMem.Delete(key)
+	} else {
+		db.activeMem.Put(key, value)
 	}
 
-	db.memtable.Put(key, value)
-	db.memtableSize++
+	// 3. Check flush threshold
+	needsFlush := db.activeMem.Size() >= db.opts.MemTableThreshold && db.immMem == nil
+	if needsFlush {
+		// Freeze active table into immutable table
+		db.immMem = db.activeMem
+		db.activeMem = memtable.NewMemTable()
 
-	if db.memtableSize >= db.maxMemtableSize {
-		if err := db.flushMemtable(); err != nil {
-			return err
-		}
-	}
+		// Rotate WAL
+		_ = db.wal.Close()
+		oldWalPath := filepath.Join(db.opts.DataDir, "active.wal")
+		flushingWalPath := filepath.Join(db.opts.DataDir, fmt.Sprintf("flushing-%d.wal", time.Now().UnixNano()))
+		_ = os.Rename(oldWalPath, flushingWalPath)
 
-	return nil
-}
-
-func (db *DB[K, V]) flushMemtable() error {
-	sstablePath := fmt.Sprintf("data-%d.sstable", db.sstableCounter)
-	sstable, err := sstable.WriteSSTable(db.memtable, sstablePath, 16)
-	if err != nil {
-		return err
-	}
-
-	db.sstables = append(db.sstables, sstable)
-	db.sstableCounter++
-
-	db.manifest.SSTablePaths = append(db.manifest.SSTablePaths, sstablePath)
-	if err := manifest.WriteManifest(db.manifestPath, db.manifest); err != nil {
-		return err
-	}
-
-	db.memtable = memtable.NewMemTable[K, V]()
-	db.memtableSize = 0
-
-	if len(db.sstables) >= db.compactionThreshold {
-		if err := db.Compact(); err != nil {
-			log.Printf("Compaction failed: %v", err)
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (db *DB[K, V]) Get(key K) (V, error) {
-	if val, ok := db.memtable.Get(key); ok {
-		if any(val).(string) == TOMBSTONE {
-			var zero V
-			return zero, ErrNotFound
-		}
-		return val, nil
-	}
-
-	for i := len(db.sstables) - 1; i >= 0; i-- {
-		table := db.sstables[i]
-		val, err := table.Get(key)
-
+		newWal, err := wal.NewWAL(oldWalPath)
 		if err != nil {
-			var zero V
-
-			if err == sstable.ErrDeleted {
-				return zero, ErrNotFound
-			}
-			if err == sstable.ErrNotFound {
-				continue
-			}
-			return zero, err
+			db.mu.Unlock()
+			return fmt.Errorf("failed to initialize rotated WAL: %w", err)
 		}
+		db.wal = newWal
 
+		// Release main RWLock before performing disk flush
+		db.mu.Unlock()
+		go db.flushMemTable(flushingWalPath)
+		return nil
+	}
+
+	db.mu.Unlock()
+	return nil
+}
+
+// flushMemTable writes immMem to a new SSTable file on disk.
+func (db *DB) flushMemTable(walToClean string) {
+	db.flushMu.Lock()
+	defer db.flushMu.Unlock()
+
+	db.mu.RLock()
+	tableToFlush := db.immMem
+	db.mu.RUnlock()
+
+	if tableToFlush == nil || tableToFlush.Size() == 0 {
+		return
+	}
+
+	sstPath := filepath.Join(db.opts.DataDir, fmt.Sprintf("sst-%d.db", time.Now().UnixNano()))
+	sst, err := sstable.WriteSSTable(tableToFlush, sstPath, db.opts.SSTableSamplingStep)
+	if err != nil {
+		// In a production engine, emit telemetry or alert compaction scheduler
+		return
+	}
+
+	db.mu.Lock()
+	// Prepend so the newest SSTable is checked first during Get()
+	db.sstables = append([]*sstable.SSTable{sst}, db.sstables...)
+	db.immMem = nil
+	db.mu.Unlock()
+
+	// Safely clean up the flushed WAL file
+	_ = os.Remove(walToClean)
+}
+
+// Get resolves the latest value for key across the hierarchy.
+func (db *DB) Get(key []byte) ([]byte, error) {
+	db.mu.RLock()
+	if db.closed {
+		db.mu.RUnlock()
+		return nil, ErrDatabaseClosed
+	}
+
+	// 1. Check Active MemTable
+	if val, deleted, found := db.activeMem.Get(key); found {
+		db.mu.RUnlock()
+		if deleted {
+			return nil, ErrKeyNotFound
+		}
 		return val, nil
 	}
 
-	var zero V
-	return zero, ErrNotFound
+	// 2. Check Immutable MemTable (if currently flushing)
+	if db.immMem != nil {
+		if val, deleted, found := db.immMem.Get(key); found {
+			db.mu.RUnlock()
+			if deleted {
+				return nil, ErrKeyNotFound
+			}
+			return val, nil
+		}
+	}
+
+	// Snapshot SSTable references to search while holding read lock
+	tables := make([]*sstable.SSTable, len(db.sstables))
+	copy(tables, db.sstables)
+	db.mu.RUnlock()
+
+	// 3. Search SSTables (from newest to oldest)
+	for _, sst := range tables {
+		val, err := sst.Get(key)
+		if err == nil {
+			return val, nil
+		}
+		if errors.Is(err, sstable.ErrDeleted) {
+			return nil, ErrKeyNotFound
+		}
+		if !errors.Is(err, sstable.ErrNotFound) {
+			return nil, err
+		}
+	}
+
+	return nil, ErrKeyNotFound
 }
 
-func (db *DB[K, V]) Delete(key K) error {
-	return db.Put(key, any(TOMBSTONE).(V))
+// Close flushes any remaining active data and safely closes handles.
+func (db *DB) Close() error {
+	db.mu.Lock()
+	if db.closed {
+		db.mu.Unlock()
+		return nil
+	}
+	db.closed = true
+
+	// If activeMem has records, trigger a synchronous flush
+	if db.activeMem.Size() > 0 {
+		sstPath := filepath.Join(db.opts.DataDir, fmt.Sprintf("sst-%d.db", time.Now().UnixNano()))
+		sst, err := sstable.WriteSSTable(db.activeMem, sstPath, db.opts.SSTableSamplingStep)
+		if err == nil {
+			db.sstables = append([]*sstable.SSTable{sst}, db.sstables...)
+		}
+	}
+
+	err := db.wal.Close()
+	db.mu.Unlock()
+	return err
 }

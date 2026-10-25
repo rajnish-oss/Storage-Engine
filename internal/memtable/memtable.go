@@ -1,24 +1,31 @@
 package memtable
 
-type MemTable[K comparable, V any] struct {
-	Data map[K]V
+type MemTable struct {
+	list *SkipList
 }
 
-func NewMemTable[K comparable, V any]() *MemTable[K, V] {
-	return &MemTable[K, V]{
-		Data: make(map[K]V),
+func NewMemTable() *MemTable {
+	return &MemTable{
+		list: NewSkipList(DefaultMaxLevel, DefaultProbability),
 	}
 }
 
-func (m *MemTable[K, V]) Put(key K, value V) {
-	m.Data[key] = value
+func (m *MemTable) Put(key, value []byte) {
+	m.list.Put(key, value, false)
 }
 
-func (m *MemTable[K, V]) Get(key K) (V, bool) {
-	value, ok := m.Data[key]
-	var zero V
-	if !ok {
-		return zero, false
-	}
-	return value, true
+func (m *MemTable) Delete(key []byte) {
+	m.list.Put(key, nil, true)
+}
+
+func (m *MemTable) Get(key []byte) ([]byte, bool, bool) {
+	return m.list.Get(key)
+}
+
+func (m *MemTable) Size() int64 {
+	return m.list.SizeBytes()
+}
+
+func (m *MemTable) Iterator() *Iterator {
+	return m.list.NewIterator()
 }

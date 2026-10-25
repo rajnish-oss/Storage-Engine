@@ -1,7 +1,7 @@
 package sstable
 
 import (
-	"encoding/gob"
+	"bytes"
 	"errors"
 	"fmt"
 	"github.com/rajnish-oss/LSM_storage_engine/internal/filter"
@@ -20,23 +20,18 @@ var (
 
 const Tombstone = "__DELETED__"
 
-type Pair[K comparable, V any] struct {
-	Key   K
-	Value V
-}
-
-type SparseEntry[K comparable] struct {
-	Key    K
+type SparseEntry struct {
+	Key    []byte
 	Offset int64
 }
 
-type SSTable[K comparable, V any] struct {
+type SSTable struct {
 	Path string
 
-	MinKey string
-	MaxKey string
+	MinKey 		[]byte
+	MaxKey      []byte
 
-	SparseIndex []SparseEntry[K]
+	SparseIndex []SparseEntry
 
 	filter *filter.BloomFilter
 }
@@ -58,25 +53,34 @@ func saveFilter(path string, bf *filter.BloomFilter) error {
 		return err
 	}
 	defer f.Close()
-	return gob.NewEncoder(f).Encode(bf)
+	// Bloom filter can be marshaled directly or encoded via binary bytes
+	data, err := bf.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	return err
 }
 
 func loadFilter(path string) (*filter.BloomFilter, error) {
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 	var bf filter.BloomFilter
-	if err := gob.NewDecoder(f).Decode(&bf); err != nil {
+	if err := bf.UnmarshalBinary(data); err != nil {
 		return nil, err
 	}
 	return &bf, nil
 }
 
-func WriteSSTable[K comparable, V any](memtable *memtable.MemTable[K, V], path string, samplingInterval int) (*SSTable[K, V], error) {
-	if len(memtable.Data) == 0 {
+func WriteSSTable(m *memtable.MemTable, path string, samplingInterval int) (*SSTable[K, V], error) {
+	if m.Size() == 0 {
 		return nil, EmptyMemtable
+	}
+
+	if samplingInterval <= 0 {
+		samplingInterval = 16
 	}
 
 	file, err := os.Create(path)
@@ -85,72 +89,73 @@ func WriteSSTable[K comparable, V any](memtable *memtable.MemTable[K, V], path s
 	}
 	defer file.Close()
 
-	pairs := make([]Pair[K, V], 0, len(memtable.Data))
-	for k, v := range memtable.Data {
-		pairs = append(pairs, Pair[K, V]{Key: k, Value: v})
-	}
-
-	sort.Slice(pairs, func(i, j int) bool {
-		return any(pairs[i].Key).(string) < any(pairs[j].Key).(string)
-	})
-
-	filter := filter.NewBloomFilter(len(pairs), 0.01)
-
 	ow := &offsetWriter{w: file}
+	bf := filter.NewBloomFilter(int(m.Size()), 0.01)
 
-	encoder := gob.NewEncoder(ow)
-	sparseIndex := make([]SparseEntry[K], 0, len(pairs)/samplingInterval)
+	var sparseIndex []SparseEntry
+	var minKey, maxKey []byte
 
-	for i, pair := range pairs {
-		if i%samplingInterval == 0 {
-			sparseIndex = append(sparseIndex, SparseEntry[K]{
-				Key:    pair.Key,
+	it := m.Iterator()
+	idx := 0
+
+	for it.HasNext() {
+		node := it.Next()
+
+		if idx == 0 {
+			minKey = make([]byte, len(node.Key))
+			copy(minKey, node.Key)
+		}
+
+		maxKey = node.Key
+
+		if idx%samplingInterval == 0 {
+			keyCopy := make([]byte, len(node.Key))
+			copy(keyCopy, node.Key)
+			sparseIndex = append(sparseIndex, SparseEntry{
+				Key:    keyCopy,
 				Offset: ow.written,
 			})
 		}
-		if err := encoder.Encode(pair); err != nil {
+
+		if _, err := codec.EncodeEntry(ow, node.Key, node.Value, node.Deleted); err != nil {
 			return nil, err
 		}
 
-		keyBytes := []byte(any(pair.Key).(string))
-		filter.Add(keyBytes)
+		bf.Add(node.Key)
+		idx++
 	}
 
-	if err := saveFilter(path+".filter", filter); err != nil {
+	finalMaxKey := make([]byte, len(maxKey))
+	copy(finalMaxKey, maxKey)
+
+	if err := saveFilter(path+".filter", bf); err != nil {
 		return nil, err
 	}
 
-	return &SSTable[K, V]{
+	return &SSTable{
 		Path:        path,
-		MinKey:      any(pairs[0].Key).(string),
-		MaxKey:      any(pairs[len(pairs)-1].Key).(string),
+		MinKey:      minKey,
+		MaxKey:      finalMaxKey,
 		SparseIndex: sparseIndex,
-		filter:      filter,
+		filter:      bf,
 	}, nil
 }
 
-func (s *SSTable[K, V]) Get(key K) (V, error) {
-	var zero V
-
-	targetStr := fmt.Sprint(key)
-
-	if targetStr < s.MinKey || targetStr > s.MaxKey {
-		return zero, ErrNotFound
+func (s *SSTable) Get(key []byte) ([]byte, error) {
+	if bytes.Compare(key, s.MinKey) < 0 || bytes.Compare(key, s.MaxKey) > 0 {
+		return nil, ErrNotFound
 	}
 
-	keyBytes := []byte(any(key).(string))
-
-	// Fast Path: skip file opening and linear gob scanning if key is absent
-	if s.filter != nil && !s.filter.Contains(keyBytes) {
-		return zero, ErrNotFound
+	if s.filter != nil && !s.filter.Contains(key) {
+		return nil, ErrNotFound
 	}
 
 	idx := sort.Search(len(s.SparseIndex), func(i int) bool {
-		return fmt.Sprint(s.SparseIndex[i].Key) > targetStr
+		return bytes.Compare(s.SparseIndex[i].Key, key) > 0
 	}) - 1
 
 	if idx < 0 {
-		return zero, ErrNotFound
+		idx = 0
 	}
 
 	startOffset := s.SparseIndex[idx].Offset
@@ -161,47 +166,40 @@ func (s *SSTable[K, V]) Get(key K) (V, error) {
 
 	file, err := os.Open(s.Path)
 	if err != nil {
-		return zero, err
+		return nil, err
 	}
 	defer file.Close()
 
 	if _, err := file.Seek(startOffset, io.SeekStart); err != nil {
-		return zero, err
+		return nil, err
 	}
 
-	var decoder *gob.Decoder
+	var reader io.Reader = file
 	if endOffset != -1 {
 		blockSize := endOffset - startOffset
-		// This limits gob from pulling bytes past the current block boundary
-		limitedReader := io.LimitReader(file, blockSize)
-		decoder = gob.NewDecoder(limitedReader)
-	} else {
-		// If it's the last block, read up to the physical End of File (EOF)
-		decoder = gob.NewDecoder(file)
+		reader = io.LimitReader(file, blockSize)
 	}
 
 	for {
-		var pair Pair[K, V]
-		if err := decoder.Decode(&pair); err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return zero, err
+		entry, err := codec.DecodeEntry(reader)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, err
 		}
 
-		keyInDB := fmt.Sprint(pair.Key)
-		if keyInDB == targetStr {
-			if fmt.Sprint(pair.Value) == Tombstone {
-				return zero, ErrDeleted
+		if bytes.Equal(entry.Key, key) {
+			if entry.IsTombstone {
+				return nil, ErrDeleted
 			}
-			return pair.Value, nil
+			return entry.Value, nil
 		}
 
-		// Since keys are strictly sorted, terminate early if we pass target
-		if keyInDB > targetStr {
+		if bytes.Compare(entry.Key, key) > 0 {
 			break
 		}
 	}
 
-	return zero, ErrNotFound
+	return nil, ErrNotFound
 }
