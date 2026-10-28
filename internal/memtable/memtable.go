@@ -1,5 +1,19 @@
 package memtable
 
+import (
+	"errors"
+)
+
+var (
+	ErrMemTableFrozen = errors.New("memtable is frozen/immutable")
+)
+
+type Reader interface {
+	Get(key []byte) (value []byte, deleted bool, found bool)
+	Size() int64
+	Iterator() *Iterator
+}
+
 type MemTable struct {
 	list *SkipList
 }

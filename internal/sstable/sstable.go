@@ -3,7 +3,6 @@ package sstable
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"github.com/rajnish-oss/LSM_storage_engine/internal/filter"
 	"github.com/rajnish-oss/LSM_storage_engine/internal/codec"
 	"github.com/rajnish-oss/LSM_storage_engine/internal/memtable"
@@ -74,7 +73,7 @@ func loadFilter(path string) (*filter.BloomFilter, error) {
 	return &bf, nil
 }
 
-func WriteSSTable(m *memtable.MemTable, path string, samplingInterval int) (*SSTable[K, V], error) {
+func WriteSSTable(m *memtable.MemTable, path string, samplingInterval int) (*SSTable, error) {
 	if m.Size() == 0 {
 		return nil, EmptyMemtable
 	}

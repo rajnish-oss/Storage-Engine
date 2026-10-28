@@ -54,10 +54,13 @@ func EncodeEntry(w io.Writer, key, val []byte, isTombstone bool) (int, error) {
 
 	// Sequential writes to target io.Writer
 	totalWritten := 0
-	for _, b := range [][]byte{header, key, val, checksumBuf} {
-		if isTombstone && &b == &val {
-			continue
-		}
+	parts := [][]byte{header, key}
+	if !isTombstone {
+		parts = append(parts, val)
+	}
+	parts = append(parts, checksumBuf)
+
+	for _, b := range parts {
 		n, err := w.Write(b)
 		totalWritten += n
 		if err != nil {

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rajnish-oss/LSM_storage_engine/internal/memtable"
@@ -15,200 +16,244 @@ import (
 
 var (
 	ErrKeyNotFound = errors.New("key not found")
-	ErrDatabaseClosed = errors.New("database is closed")
+	ErrClosed      = errors.New("database is closed")
 )
 
-// Options holds engine configuration parameters.
-type Options struct {
-	DataDir             string
-	MemTableThreshold   int64 // In bytes (e.g., 4MB = 4 * 1024 * 1024)
-	SSTableSamplingStep int   // Interval for sparse index entries (e.g., 16 or 64)
-	SyncWAL             bool  // If true, call fsync on every write
+type Config struct {
+	DataDir           string
+	MemTableThreshold int64        // Max size in bytes before rotating active MemTable
+	MaxImmTables      int
+	WALSyncMode       wal.SyncMode // SyncNone, SyncAlways, SyncBatch
+	WALBatchInterval  time.Duration
+	WALBatchSize      int
+	SamplingInterval  int // Sparse index interval for WriteSSTable
 }
 
-func DefaultOptions(dataDir string) Options {
-	return Options{
-		DataDir:             dataDir,
-		MemTableThreshold:   4 * 1024 * 1024, // 4MB default
-		SSTableSamplingStep: 16,
-		SyncWAL:             false,
+func DefaultConfig(dataDir string) Config {
+	return Config{
+		DataDir:           dataDir,
+		MemTableThreshold: 4 * 1024 * 1024, // 4MB
+		MaxImmTables:      3,
+		WALSyncMode:       wal.SyncBatch,
+		WALBatchInterval:  5 * time.Millisecond,
+		WALBatchSize:      256,
+		SamplingInterval:  16,
 	}
 }
 
-// DB represents the LSM storage engine instance.
+type flushTask struct {
+	mem memtable.Reader
+	wal *wal.WALSegment
+}
+
 type DB struct {
-	mu        sync.RWMutex
-	flushMu   sync.Mutex // Serializes flush operations
-	opts      Options
-	activeMem *memtable.MemTable
-	immMem    *memtable.MemTable
-	wal       *wal.WAL
-	sstables  []*sstable.SSTable
-	closed    bool
+	mu           sync.RWMutex
+	cfg          Config
+	mem          *memtable.MemTable
+	immQueue     []flushTask
+	activeWAL    *wal.WALSegment
+	flushingWAL  *wal.WALSegment
+	currentSegID uint64
+	sstables     []*sstable.SSTable
+	flushCond    *sync.Cond
+	closeCh      chan struct{}
+	flushWg      sync.WaitGroup
+	isClosed     uint32
 }
 
-// Open initializes or recovers an LSM DB directory.
-func Open(opts Options) (*DB, error) {
-	if err := os.MkdirAll(opts.DataDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create data dir: %w", err)
+// Open initializes directories, replays un-persisted WAL segments, and starts the background flusher.
+func Open(cfg Config) (*DB, error) {
+	walDir := filepath.Join(cfg.DataDir, "wal")
+	sstDir := filepath.Join(cfg.DataDir, "sst")
+
+	if err := os.MkdirAll(walDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create wal dir: %w", err)
 	}
-
-	walPath := filepath.Join(opts.DataDir, "active.wal")
-
-	// Replay existing WAL if present
-	recoveredMem, err := wal.ReplayWAL(walPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to replay WAL: %w", err)
-	}
-
-	w, err := wal.NewWAL(walPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open WAL: %w", err)
+	if err := os.MkdirAll(sstDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create sst dir: %w", err)
 	}
 
 	db := &DB{
-		opts:      opts,
-		activeMem: recoveredMem,
-		wal:       w,
-		sstables:  make([]*sstable.SSTable, 0),
+		cfg:      cfg,
+		mem:      memtable.NewMemTable(),
+		immQueue: make([]flushTask, 0, cfg.MaxImmTables),
+		closeCh:  make(chan struct{}),
 	}
+	db.flushCond = sync.NewCond(&db.mu)
+
+	// 1. Recover un-persisted records from existing WAL segments
+	if err := db.recoverWAL(walDir); err != nil {
+		return nil, fmt.Errorf("wal recovery failed: %w", err)
+	}
+
+	// 2. Open next active WAL segment
+	db.currentSegID++
+	walOpts := wal.Options{
+		Dir:           walDir,
+		SyncMode:      cfg.WALSyncMode,
+		BatchInterval: cfg.WALBatchInterval,
+		BatchSize:     cfg.WALBatchSize,
+	}
+	activeSeg, err := wal.NewSegment(walOpts, db.currentSegID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create active wal segment: %w", err)
+	}
+	db.activeWAL = activeSeg
+
+	// 3. Start background flush worker
+	db.flushWg.Add(1)
+	go db.flushWorker()
 
 	return db, nil
 }
 
-// Put writes or updates a key-value pair.
+func (db *DB) recoverWAL(walDir string) error {
+	segIDs, err := wal.DiscoverSegments(walDir)
+	if err != nil {
+		return err
+	}
+
+	for _, id := range segIDs {
+		segPath := filepath.Join(walDir, fmt.Sprintf("%05d.wal", id))
+		replayedMem, err := wal.ReplaySegment(segPath)
+		if err != nil {
+			return err
+		}
+
+		it := replayedMem.Iterator()
+		for it.HasNext() {
+			node := it.Next()
+			if node.Deleted {
+				db.mem.Delete(node.Key)
+			} else {
+				db.mem.Put(node.Key, node.Value)
+			}
+		}
+
+		if id > db.currentSegID {
+			db.currentSegID = id
+		}
+
+		_ = os.Remove(segPath)
+	}
+
+	return nil
+}
+
 func (db *DB) Put(key, value []byte) error {
 	return db.write(key, value, false)
 }
 
-// Delete appends a deletion tombstone for the given key.
 func (db *DB) Delete(key []byte) error {
 	return db.write(key, nil, true)
 }
 
 func (db *DB) write(key, value []byte, isTombstone bool) error {
-	db.mu.Lock()
-	if db.closed {
-		db.mu.Unlock()
-		return ErrDatabaseClosed
+	if atomic.LoadUint32(&db.isClosed) == 1 {
+		return ErrClosed
 	}
 
-	// 1. Write to Write-Ahead Log
-	if err := db.wal.Write(key, value, isTombstone); err != nil {
-		db.mu.Unlock()
+	db.mu.Lock()
+
+	for len(db.immQueue) >= db.cfg.MaxImmTables {
+		db.flushCond.Wait()
+		if atomic.LoadUint32(&db.isClosed) == 1 {
+			db.mu.Unlock()
+			return ErrClosed
+		}
+	}
+
+// 2. ROTATION: Check if active MemTable exceeds threshold
+	if db.mem.Size() >= db.cfg.MemTableThreshold {
+		if err := db.rotateMemTable(); err != nil {
+			db.mu.Unlock()
+			return fmt.Errorf("memtable rotation failed: %w", err)
+		}
+	}
+
+	currentWAL := db.activeWAL
+	currentMem := db.mem
+	db.mu.Unlock()
+
+	// Append to WAL
+	if err := currentWAL.Write(key, value, isTombstone); err != nil {
 		return fmt.Errorf("wal write failed: %w", err)
 	}
 
-	if db.opts.SyncWAL {
-		if err := db.wal.Sync(); err != nil {
-			db.mu.Unlock()
-			return fmt.Errorf("wal sync failed: %w", err)
-		}
-	}
-
-	// 2. Insert into Active SkipList MemTable
+	// Insert into in-memory table
 	if isTombstone {
-		db.activeMem.Delete(key)
-	} else {
-		db.activeMem.Put(key, value)
+		 currentMem.Delete(key)
+	}else{
+		currentMem.Put(key, value)
 	}
-
-	// 3. Check flush threshold
-	needsFlush := db.activeMem.Size() >= db.opts.MemTableThreshold && db.immMem == nil
-	if needsFlush {
-		// Freeze active table into immutable table
-		db.immMem = db.activeMem
-		db.activeMem = memtable.NewMemTable()
-
-		// Rotate WAL
-		_ = db.wal.Close()
-		oldWalPath := filepath.Join(db.opts.DataDir, "active.wal")
-		flushingWalPath := filepath.Join(db.opts.DataDir, fmt.Sprintf("flushing-%d.wal", time.Now().UnixNano()))
-		_ = os.Rename(oldWalPath, flushingWalPath)
-
-		newWal, err := wal.NewWAL(oldWalPath)
-		if err != nil {
-			db.mu.Unlock()
-			return fmt.Errorf("failed to initialize rotated WAL: %w", err)
-		}
-		db.wal = newWal
-
-		// Release main RWLock before performing disk flush
-		db.mu.Unlock()
-		go db.flushMemTable(flushingWalPath)
-		return nil
-	}
-
-	db.mu.Unlock()
 	return nil
 }
 
-// flushMemTable writes immMem to a new SSTable file on disk.
-func (db *DB) flushMemTable(walToClean string) {
-	db.flushMu.Lock()
-	defer db.flushMu.Unlock()
+// rotateMemTable freezes the current active table, creates a new one, and steps WAL segment generation.
+// Must be called with db.mu held.
+func (db *DB) rotateMemTable() error {
+	db.immQueue = append(db.immQueue, flushTask{
+		mem: db.mem,
+		wal: db.activeWAL,
+	})
 
-	db.mu.RLock()
-	tableToFlush := db.immMem
-	db.mu.RUnlock()
-
-	if tableToFlush == nil || tableToFlush.Size() == 0 {
-		return
+	db.currentSegID++
+	walOpts := wal.Options{
+		Dir:           filepath.Join(db.cfg.DataDir, "wal"),
+		SyncMode:      db.cfg.WALSyncMode,
+		BatchInterval: db.cfg.WALBatchInterval,
+		BatchSize:     db.cfg.WALBatchSize,
 	}
 
-	sstPath := filepath.Join(db.opts.DataDir, fmt.Sprintf("sst-%d.db", time.Now().UnixNano()))
-	sst, err := sstable.WriteSSTable(tableToFlush, sstPath, db.opts.SSTableSamplingStep)
+	newWAL, err := wal.NewSegment(walOpts, db.currentSegID)
 	if err != nil {
-		// In a production engine, emit telemetry or alert compaction scheduler
-		return
+		return err
 	}
 
-	db.mu.Lock()
-	// Prepend so the newest SSTable is checked first during Get()
-	db.sstables = append([]*sstable.SSTable{sst}, db.sstables...)
-	db.immMem = nil
-	db.mu.Unlock()
+	db.activeWAL = newWAL
+	db.mem = memtable.NewMemTable()
 
-	// Safely clean up the flushed WAL file
-	_ = os.Remove(walToClean)
+	db.flushCond.Signal()
+	return nil
 }
 
-// Get resolves the latest value for key across the hierarchy.
+// Get checks mem, imm, and on-disk SSTables.
 func (db *DB) Get(key []byte) ([]byte, error) {
-	db.mu.RLock()
-	if db.closed {
-		db.mu.RUnlock()
-		return nil, ErrDatabaseClosed
+	if atomic.LoadUint32(&db.isClosed) == 1 {
+		return nil, ErrClosed
 	}
 
-	// 1. Check Active MemTable
-	if val, deleted, found := db.activeMem.Get(key); found {
+	db.mu.RLock()
+	// 1. Search active MemTable
+	val, tombstone, found := db.mem.Get(key)
+	if found {
 		db.mu.RUnlock()
-		if deleted {
+		if tombstone {
 			return nil, ErrKeyNotFound
 		}
 		return val, nil
 	}
 
-	// 2. Check Immutable MemTable (if currently flushing)
-	if db.immMem != nil {
-		if val, deleted, found := db.immMem.Get(key); found {
+	// 2. Search immutable queue (newest to oldest)
+	for i := len(db.immQueue) - 1; i >= 0; i-- {
+		val, tombstone, found := db.immQueue[i].mem.Get(key)
+		if found {
 			db.mu.RUnlock()
-			if deleted {
+			if tombstone {
 				return nil, ErrKeyNotFound
 			}
 			return val, nil
 		}
 	}
 
-	// Snapshot SSTable references to search while holding read lock
+	// Copy SSTable slice pointers to scan without holding RLock during disk reads
 	tables := make([]*sstable.SSTable, len(db.sstables))
 	copy(tables, db.sstables)
 	db.mu.RUnlock()
 
-	// 3. Search SSTables (from newest to oldest)
-	for _, sst := range tables {
-		val, err := sst.Get(key)
+	// 3. Search SSTables newest to oldest
+	for i := len(tables) - 1; i >= 0; i-- {
+		val, err := tables[i].Get(key)
 		if err == nil {
 			return val, nil
 		}
@@ -223,25 +268,73 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	return nil, ErrKeyNotFound
 }
 
-// Close flushes any remaining active data and safely closes handles.
-func (db *DB) Close() error {
-	db.mu.Lock()
-	if db.closed {
+func (db *DB) flushWorker() {
+	defer db.flushWg.Done()
+
+	for {
+		db.mu.Lock()
+		for len(db.immQueue) == 0 {
+			select {
+			case <-db.closeCh:
+				// Engine closing: finish draining any remaining tables in queue
+				if len(db.immQueue) == 0 {
+					db.mu.Unlock()
+					return
+				}
+			default:
+			}
+			db.flushCond.Wait()
+		}
+
+		// Pop oldest task (FIFO)
+		task := db.immQueue[0]
 		db.mu.Unlock()
+
+		// DISK I/O: performed without holding db.mu
+		sstPath := filepath.Join(db.cfg.DataDir, "sst", fmt.Sprintf("%05d.sst", task.wal.SegmentID()))
+		newSST, err := sstable.WriteSSTable(task.mem, sstPath, db.cfg.SamplingInterval)
+		if err != nil {
+			// In production, log or trigger recovery
+			continue
+		}
+
+		// Clean up flushed table and notify stalled writers
+		db.mu.Lock()
+		db.sstables = append(db.sstables, newSST)
+		db.immQueue = db.immQueue[1:]
+
+		// Signal stalled writers waiting for free buffer space
+		db.flushCond.Broadcast()
+		db.mu.Unlock()
+
+		// Safely discard persisted WAL segment
+		_ = task.wal.Remove()
+	}
+}
+
+// Close flushes any remaining active table and frees open handles.
+func (db *DB) Close() error {
+	if !atomic.CompareAndSwapUint32(&db.isClosed, 0, 1) {
 		return nil
 	}
-	db.closed = true
 
-	// If activeMem has records, trigger a synchronous flush
-	if db.activeMem.Size() > 0 {
-		sstPath := filepath.Join(db.opts.DataDir, fmt.Sprintf("sst-%d.db", time.Now().UnixNano()))
-		sst, err := sstable.WriteSSTable(db.activeMem, sstPath, db.opts.SSTableSamplingStep)
-		if err == nil {
-			db.sstables = append([]*sstable.SSTable{sst}, db.sstables...)
-		}
+	db.mu.Lock()
+	if db.mem.Size() > 0 {
+		_ = db.rotateMemTable()
+	}
+	db.mu.Unlock()
+
+	// Signal shutdown to flusher and unblock waiters
+	close(db.closeCh)
+	db.flushCond.Broadcast()
+	db.flushWg.Wait()
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if db.activeWAL != nil {
+		return db.activeWAL.Close()
 	}
 
-	err := db.wal.Close()
-	db.mu.Unlock()
-	return err
+	return nil
 }
