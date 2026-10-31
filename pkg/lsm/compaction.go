@@ -21,7 +21,7 @@ type MinHeap []*HeapItem
 
 func (h MinHeap) Len() int      { return len(h) }
 func (h MinHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
-func (h MinHeap) Push(x any)    { h = append(h, x.(*HeapItem)) }
+func (h *MinHeap) Push(x any)    { *h = append(*h, x.(*HeapItem)) }
 func (h *MinHeap) Pop() any {
 	old := *h
 	n := len(old)
@@ -39,8 +39,8 @@ func (h MinHeap) Less(i, j int) bool {
 	return h[i].SSTableIndex > h[j].SSTableIndex
 }
 
-// MergeSSTables performs a multi-way streaming merge over multiple SSTables,
-// deduplicates duplicate keys, removes tombstones, and outputs a compacted SSTable.
+// MergeSSTables executes a streaming K-way merge across input SSTables,
+// drops overwritten keys and tombstones, and emits a new SSTable with an active Bloom filter.
 func MergeSSTables(sstables []*sstable.SSTable, newPath string, samplingInterval int) (*sstable.SSTable, error) {
 	if len(sstables) == 0 {
 		return nil, errors.New("no sstables provided for compaction")
@@ -72,6 +72,18 @@ func MergeSSTables(sstables []*sstable.SSTable, newPath string, samplingInterval
 	h := &MinHeap{}
 	heap.Init(h)
 
+	// Estimate upper-bound keys across all tables for the Bloom filter sizing
+	// Fallback to 1024 if sampling estimates are small to keep false positives low
+	estimatedKeys := 0
+	for _, sst := range sstables {
+		estimatedKeys += len(sst.SparseIndex) * samplingInterval
+	}
+	if estimatedKeys <= 0 {
+		estimatedKeys = 1024
+	}
+
+	bf := filter.NewBloomFilter(estimatedKeys, 0.01)
+
 	// Prime the min-heap with the first entry from each SSTable
 	for i, file := range files {
 		entry, err := codec.DecodeEntry(file)
@@ -90,7 +102,6 @@ func MergeSSTables(sstables []*sstable.SSTable, newPath string, samplingInterval
 		minKey      []byte
 		maxKey      []byte
 		sparseIndex []sstable.SparseEntry
-		writtenKeys [][]byte
 		totalOffset int64
 		idxCounter  int
 	)
@@ -122,17 +133,14 @@ func MergeSSTables(sstables []*sstable.SSTable, newPath string, samplingInterval
 		}
 
 		if idxCounter == 0 {
-			minKey = make([]byte, len(item.Entry.Key))
-			copy(minKey, item.Entry.Key)
+			minKey = append([]byte(nil), item.Entry.Key...)
 		}
-		maxKey = item.Entry.Key
+		maxKey = append([]byte(nil), item.Entry.Key...)
 
 		// Checkpoint sparse index
 		if idxCounter%samplingInterval == 0 {
-			keyCopy := make([]byte, len(item.Entry.Key))
-			copy(keyCopy, item.Entry.Key)
 			sparseIndex = append(sparseIndex, sstable.SparseEntry{
-				Key:    keyCopy,
+				Key:    append([]byte(nil), item.Entry.Key...),
 				Offset: totalOffset,
 			})
 		}
@@ -143,24 +151,23 @@ func MergeSSTables(sstables []*sstable.SSTable, newPath string, samplingInterval
 		}
 
 		totalOffset += int64(n)
-		writtenKeys = append(writtenKeys, append([]byte(nil), item.Entry.Key...))
+		bf.Add(item.Entry.Key)
 		idxCounter++
 	}
 
 	finalMaxKey := make([]byte, len(maxKey))
 	copy(finalMaxKey, maxKey)
 
-	// Rebuild and persist the Bloom filter
-	bf := filter.NewBloomFilter(len(writtenKeys), 0.01)
-	for _, k := range writtenKeys {
-		bf.Add(k)
-	}
 
 	bfData, err := bf.MarshalBinary()
 	if err != nil {
 		return nil, err
 	}
 	if err := os.WriteFile(newPath+".filter", bfData, 0644); err != nil {
+		return nil, err
+	}
+
+	if err := newFile.Sync(); err != nil {
 		return nil, err
 	}
 

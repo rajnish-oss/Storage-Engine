@@ -154,11 +154,11 @@ func (db *DB) write(key, value []byte, isTombstone bool) error {
 	}
 
 	db.mu.Lock()
+	defer db.mu.Unlock()
 
 	for len(db.immQueue) >= db.cfg.MaxImmTables {
 		db.flushCond.Wait()
 		if atomic.LoadUint32(&db.isClosed) == 1 {
-			db.mu.Unlock()
 			return ErrClosed
 		}
 	}
@@ -166,14 +166,12 @@ func (db *DB) write(key, value []byte, isTombstone bool) error {
 // 2. ROTATION: Check if active MemTable exceeds threshold
 	if db.mem.Size() >= db.cfg.MemTableThreshold {
 		if err := db.rotateMemTable(); err != nil {
-			db.mu.Unlock()
 			return fmt.Errorf("memtable rotation failed: %w", err)
 		}
 	}
 
 	currentWAL := db.activeWAL
 	currentMem := db.mem
-	db.mu.Unlock()
 
 	// Append to WAL
 	if err := currentWAL.Write(key, value, isTombstone); err != nil {
@@ -288,20 +286,35 @@ func (db *DB) flushWorker() {
 
 		// Pop oldest task (FIFO)
 		task := db.immQueue[0]
+		db.immQueue = db.immQueue[1:]
 		db.mu.Unlock()
 
 		// DISK I/O: performed without holding db.mu
 		sstPath := filepath.Join(db.cfg.DataDir, "sst", fmt.Sprintf("%05d.sst", task.wal.SegmentID()))
-		newSST, err := sstable.WriteSSTable(task.mem, sstPath, db.cfg.SamplingInterval)
+
+		memConcrete, ok := task.mem.(*memtable.MemTable)
+		if !ok {
+			db.mu.Lock()
+			db.flushCond.Broadcast()
+			db.mu.Unlock()
+			continue // Or log an error: unexpected interface implementation
+		}
+
+		newSST, err := sstable.WriteSSTable(memConcrete, sstPath, db.cfg.SamplingInterval)
 		if err != nil {
 			// In production, log or trigger recovery
+			continue
+		}
+		if err != nil {
+			db.mu.Lock()
+			db.flushCond.Broadcast()
+			db.mu.Unlock()
 			continue
 		}
 
 		// Clean up flushed table and notify stalled writers
 		db.mu.Lock()
 		db.sstables = append(db.sstables, newSST)
-		db.immQueue = db.immQueue[1:]
 
 		// Signal stalled writers waiting for free buffer space
 		db.flushCond.Broadcast()
